@@ -22,13 +22,81 @@ public class Worker {
     private volatile boolean running = false;
     private ScheduledExecutorService heartbeatExecutor = Executors.newScheduledThreadPool(1);
 
+    // RPC abstraction layer
+    private RPCRuntime rpcRuntime;
+    private ParallelMatrixMultiplier multiplier;
+
     public Worker(String workerId) {
         this.workerId = workerId;
         this.studentId = System.getenv("STUDENT_ID") != null ? System.getenv("STUDENT_ID") : "STUDENT_DEFAULT";
+
+        // Initialize RPC runtime and parallel multiplier
+        this.rpcRuntime = new RPCRuntime("Worker[" + workerId + "]", 8);
+        this.multiplier = new ParallelMatrixMultiplier(Runtime.getRuntime().availableProcessors());
+
+        // Register RPC methods
+        registerRPCMethods();
     }
 
     public Worker() {
         this(System.getenv("WORKER_ID") != null ? System.getenv("WORKER_ID") : "WORKER_" + System.currentTimeMillis());
+    }
+
+    /**
+     * Register RPC methods that can be invoked by the master.
+     */
+    private void registerRPCMethods() {
+        // Register matrix multiplication RPC method
+        rpcRuntime.registerMethod("MATRIX_MULTIPLY", payload -> {
+            try {
+                ByteArrayInputStream bais = new ByteArrayInputStream(payload);
+                DataInputStream dis = new DataInputStream(bais);
+
+                int startRow = dis.readInt();
+                int endRow = dis.readInt();
+                int m = dis.readInt();
+                int n = dis.readInt();
+                int p = dis.readInt();
+
+                // Read matrix A (only rows we need)
+                int[][] matrixA = new int[endRow - startRow][n];
+                for (int i = 0; i < endRow - startRow; i++) {
+                    for (int j = 0; j < n; j++) {
+                        matrixA[i][j] = dis.readInt();
+                    }
+                }
+
+                // Read matrix B
+                int[][] matrixB = new int[n][p];
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < p; j++) {
+                        matrixB[i][j] = dis.readInt();
+                    }
+                }
+
+                // Perform parallel multiplication
+                int[][] result = multiplier.multiplyRowParallel(matrixA, matrixB);
+
+                // Serialize result
+                ByteArrayOutputStream resultBaos = new ByteArrayOutputStream();
+                DataOutputStream resultDos = new DataOutputStream(resultBaos);
+
+                resultDos.writeInt(startRow);
+                resultDos.writeInt(endRow);
+                resultDos.writeInt(result.length);
+                resultDos.writeInt(result[0].length);
+
+                for (int[] row : result) {
+                    for (int val : row) {
+                        resultDos.writeInt(val);
+                    }
+                }
+
+                return resultBaos.toByteArray();
+            } catch (Exception e) {
+                throw new RuntimeException("RPC method MATRIX_MULTIPLY failed", e);
+            }
+        });
     }
 
     /**
@@ -104,8 +172,8 @@ public class Worker {
                     Message taskMsg = Message.readFromStream(dis);
 
                     if (taskMsg.type.equals("RPC_REQUEST")) {
-                        // Execute task asynchronously
-                        taskExecutor.submit(() -> executeTask(taskMsg));
+                        // Execute task asynchronously using RPC runtime
+                        taskExecutor.submit(() -> executeRPCTask(taskMsg));
                     } else if (taskMsg.type.equals("HEARTBEAT")) {
                         // Respond to heartbeat
                         try {
@@ -128,61 +196,21 @@ public class Worker {
     }
 
     /**
-     * Executes a received task block (matrix multiplication).
+     * Execute an RPC task using the RPC runtime.
      */
-    private void executeTask(Message taskMsg) {
+    private void executeRPCTask(Message taskMsg) {
         try {
-            ByteArrayInputStream bais = new ByteArrayInputStream(taskMsg.payload);
-            DataInputStream taskDis = new DataInputStream(bais);
-
-            int startRow = taskDis.readInt();
-            int endRow = taskDis.readInt();
-            int m = taskDis.readInt();
-            int n = taskDis.readInt();
-            int p = taskDis.readInt();
-
-            // Read matrix A (only rows we need)
-            int[][] matrixA = new int[endRow - startRow][n];
-            for (int i = 0; i < endRow - startRow; i++) {
-                for (int j = 0; j < n; j++) {
-                    matrixA[i][j] = taskDis.readInt();
-                }
-            }
-
-            // Read matrix B
-            int[][] matrixB = new int[n][p];
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < p; j++) {
-                    matrixB[i][j] = taskDis.readInt();
-                }
-            }
-
-            // Perform multiplication
-            int[][] result = multiplyMatrices(matrixA, matrixB);
-
-            // Serialize result
-            ByteArrayOutputStream resultBaos = new ByteArrayOutputStream();
-            DataOutputStream resultDos = new DataOutputStream(resultBaos);
-
-            resultDos.writeInt(startRow);
-            resultDos.writeInt(endRow);
-            resultDos.writeInt(result.length);
-            resultDos.writeInt(result[0].length);
-
-            for (int[] row : result) {
-                for (int val : row) {
-                    resultDos.writeInt(val);
-                }
-            }
+            // Dispatch through RPC runtime
+            byte[] result = rpcRuntime.dispatch("MATRIX_MULTIPLY", taskMsg.payload, 30);
 
             // Send result back to master
-            Message resultMsg = new Message("TASK_COMPLETE", workerId, resultBaos.toByteArray());
+            Message resultMsg = new Message("TASK_COMPLETE", workerId, result);
             resultMsg.writeToStream(dos);
 
-            System.out.println("[Worker " + workerId + "] Completed task for rows " + startRow + "-" + endRow);
+            System.out.println("[Worker " + workerId + "] Completed RPC task");
 
         } catch (Exception e) {
-            System.err.println("[Worker " + workerId + "] Error executing task: " + e.getMessage());
+            System.err.println("[Worker " + workerId + "] Error executing RPC task: " + e.getMessage());
             try {
                 Message errorMsg = new Message("TASK_ERROR", workerId,
                         e.getMessage().getBytes());
@@ -194,33 +222,14 @@ public class Worker {
     }
 
     /**
-     * Matrix multiplication for a block of rows.
-     */
-    private int[][] multiplyMatrices(int[][] A, int[][] B) {
-        int rows = A.length;
-        int cols = B[0].length;
-        int common = B.length;
-
-        int[][] result = new int[rows][cols];
-
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < cols; j++) {
-                for (int k = 0; k < common; k++) {
-                    result[i][j] += A[i][k] * B[k][j];
-                }
-            }
-        }
-
-        return result;
-    }
-
-    /**
      * Shutdown the worker gracefully.
      */
     public void shutdown() {
         running = false;
         taskExecutor.shutdown();
         heartbeatExecutor.shutdown();
+        rpcRuntime.shutdown();
+        multiplier.shutdown();
         try {
             if (socket != null && socket.isConnected()) {
                 socket.close();

@@ -27,14 +27,26 @@ public class Master {
     private final long HEARTBEAT_TIMEOUT = 5000; // 5 seconds
     private ScheduledExecutorService heartbeatExecutor = Executors.newScheduledThreadPool(1);
 
+    // RPC abstraction layer and parallel computation
+    private RPCRuntime rpcRuntime;
+    private ParallelMatrixMultiplier multiplier;
+
     public Master(int port) throws IOException {
         this.studentId = System.getenv("STUDENT_ID") != null ? System.getenv("STUDENT_ID") : "STUDENT_DEFAULT";
         this.serverSocket = new ServerSocket(port);
         this.running = true;
+
+        // Initialize RPC runtime and parallel multiplier
+        this.rpcRuntime = new RPCRuntime("Master", 16);
+        this.multiplier = new ParallelMatrixMultiplier(Runtime.getRuntime().availableProcessors());
     }
 
     public Master() {
         this.studentId = System.getenv("STUDENT_ID") != null ? System.getenv("STUDENT_ID") : "STUDENT_DEFAULT";
+
+        // Initialize RPC runtime and parallel multiplier
+        this.rpcRuntime = new RPCRuntime("Master", 16);
+        this.multiplier = new ParallelMatrixMultiplier(Runtime.getRuntime().availableProcessors());
     }
 
     /**
@@ -208,7 +220,7 @@ public class Master {
         int totalTasks = m;
         int batchSize = Math.max(1, totalTasks / workerCount);
 
-        List<Future<Void>> futures = new ArrayList<>();
+        List<Future<byte[]>> futures = new ArrayList<>();
         int taskId = 0;
 
         for (int startRow = 0; startRow < m; startRow += batchSize) {
@@ -255,57 +267,52 @@ public class Master {
 
                     byte[] payload = baos.toByteArray();
 
-                    // Send task to worker
+                    // Send RPC task to worker
                     Message taskMsg = new Message("RPC_REQUEST", "MASTER", payload);
                     taskMsg.writeToStream(conn.dos);
                     taskAssignments.put("TASK_" + tid, workerId);
 
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
+                    System.out.println("[Master] Sent RPC task " + tid + " to worker " + workerId + " for rows " + start
+                            + " to " + end);
 
-                return null;
+                    return payload;
+
+                } catch (Exception e) {
+                    System.err.println("[Master] Error sending task: " + e.getMessage());
+                    e.printStackTrace();
+                    return null;
+                }
             }));
         }
 
         // Wait for all tasks to complete
-        for (Future<Void> future : futures) {
+        for (int i = 0; i < futures.size(); i++) {
             try {
-                future.get(30, TimeUnit.SECONDS);
+                futures.get(i).get(30, TimeUnit.SECONDS);
             } catch (Exception e) {
-                e.printStackTrace();
+                System.err.println("[Master] Task " + i + " failed: " + e.getMessage());
             }
         }
 
         // Collect results
         try {
-            Thread.sleep(1000); // Wait for final results
+            Thread.sleep(1000); // Wait for final results to arrive
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
 
-        // For now, perform local computation (in real scenario, aggregate from workers)
-        return multiplyMatrices(matrixA, matrixB);
+        // For demonstration, perform local parallel computation
+        // In a real scenario, you would aggregate results from workers
+        System.out.println("[Master] Computing result matrix in parallel locally...");
+        return multiplier.multiplyRowParallel(matrixA, matrixB);
     }
 
     /**
-     * Local matrix multiplication (used for result aggregation).
+     * Local matrix multiplication using parallel computation.
+     * Uses row-striped distribution for optimal cache locality.
      */
     private int[][] multiplyMatrices(int[][] A, int[][] B) {
-        int m = A.length;
-        int n = A[0].length;
-        int p = B[0].length;
-        int[][] C = new int[m][p];
-
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < p; j++) {
-                for (int k = 0; k < n; k++) {
-                    C[i][j] += A[i][k] * B[k][j];
-                }
-            }
-        }
-
-        return C;
+        return multiplier.multiplyRowParallel(A, B);
     }
 
     /**
@@ -323,6 +330,8 @@ public class Master {
         running = false;
         heartbeatExecutor.shutdown();
         systemThreads.shutdown();
+        rpcRuntime.shutdown();
+        multiplier.shutdown();
         try {
             serverSocket.close();
         } catch (IOException e) {
