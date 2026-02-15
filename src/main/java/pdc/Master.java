@@ -17,9 +17,10 @@ public class Master {
 
     private final ExecutorService systemThreads = Executors.newCachedThreadPool();
     private final Map<String, WorkerConnection> registeredWorkers = new ConcurrentHashMap<>();
-    private final Map<String, byte[]> taskResults = new ConcurrentHashMap<>();
+    private final Map<Integer, byte[]> taskResults = new ConcurrentHashMap<>(); // taskId -> result payload
     private final Map<String, String> taskAssignments = new ConcurrentHashMap<>(); // taskId -> workerId
     private final BlockingQueue<String> availableWorkers = new LinkedBlockingQueue<>();
+    private volatile int resultCounter = 0;
 
     private ServerSocket serverSocket;
     private String studentId;
@@ -135,9 +136,13 @@ public class Master {
      */
     private void handleWorkerMessage(String workerId, Message msg) {
         if (msg.type.equals("TASK_COMPLETE")) {
-            String taskId = new String(msg.payload);
-            taskResults.put(taskId, msg.payload);
-            System.out.println("[Master] Task " + taskId + " completed by " + workerId);
+            // Store complete result payload with unique task ID as key
+            // The payload contains: startRow(int), endRow(int), resultRows, resultCols,
+            // then matrix data
+            int resultId = resultCounter++;
+            taskResults.put(resultId, msg.payload);
+            System.out.println("[Master] Task completed by " + workerId + ", result id: " + resultId
+                    + ", payload size: " + msg.payload.length);
 
             // Make worker available again
             availableWorkers.offer(workerId);
@@ -218,16 +223,23 @@ public class Master {
 
         // Partition work: assign each row of result to a worker
         int totalTasks = m;
-        int batchSize = Math.max(1, totalTasks / workerCount);
+        int batchSize = Math.max(1, totalTasks / Math.max(1, workerCount));
 
-        List<Future<byte[]>> futures = new ArrayList<>();
+        List<Future<String>> futures = new ArrayList<>();
+        Map<Integer, String> taskMap = new HashMap<>(); // taskId -> workerId
+        Map<Integer, int[]> partialResults = new ConcurrentHashMap<>(); // taskId -> partial result rows
+        Map<Integer, Integer> taskStartRows = new HashMap<>(); // taskId -> start row
+
         int taskId = 0;
 
         for (int startRow = 0; startRow < m; startRow += batchSize) {
             int endRow = Math.min(startRow + batchSize, m);
             final int start = startRow;
             final int end = endRow;
-            final int tid = taskId++;
+            final int tid = taskId;
+            final int numRows = end - start;
+
+            taskStartRows.put(tid, start);
 
             futures.add(systemThreads.submit(() -> {
                 try {
@@ -242,6 +254,8 @@ public class Master {
                         throw new RuntimeException("Worker lost: " + workerId);
                     }
 
+                    taskMap.put(tid, workerId);
+
                     // Serialize task
                     ByteArrayOutputStream baos = new ByteArrayOutputStream();
                     DataOutputStream dos = new DataOutputStream(baos);
@@ -251,7 +265,7 @@ public class Master {
                     dos.writeInt(n);
                     dos.writeInt(p);
 
-                    // Write matrix A
+                    // Write matrix A rows
                     for (int i = start; i < end; i++) {
                         for (int j = 0; j < n; j++) {
                             dos.writeInt(matrixA[i][j]);
@@ -270,41 +284,84 @@ public class Master {
                     // Send RPC task to worker
                     Message taskMsg = new Message("RPC_REQUEST", "MASTER", payload);
                     taskMsg.writeToStream(conn.dos);
-                    taskAssignments.put("TASK_" + tid, workerId);
 
                     System.out.println("[Master] Sent RPC task " + tid + " to worker " + workerId + " for rows " + start
                             + " to " + end);
 
-                    return payload;
+                    return workerId;
 
                 } catch (Exception e) {
-                    System.err.println("[Master] Error sending task: " + e.getMessage());
+                    System.err.println("[Master] Error sending task " + tid + ": " + e.getMessage());
                     e.printStackTrace();
                     return null;
                 }
             }));
+
+            taskId++;
         }
 
-        // Wait for all tasks to complete
+        // Wait for all tasks to be sent
+        int successfulTasks = 0;
         for (int i = 0; i < futures.size(); i++) {
             try {
-                futures.get(i).get(30, TimeUnit.SECONDS);
+                String result_str = futures.get(i).get(15, TimeUnit.SECONDS);
+                if (result_str != null) {
+                    successfulTasks++;
+                }
             } catch (Exception e) {
                 System.err.println("[Master] Task " + i + " failed: " + e.getMessage());
             }
         }
 
-        // Collect results
-        try {
-            Thread.sleep(1000); // Wait for final results to arrive
-        } catch (InterruptedException e) {
-            e.printStackTrace();
+        System.out.println("[Master] Tasks sent: " + successfulTasks + " out of " + futures.size());
+
+        // Wait for results to arrive from workers
+        int maxWaitTime = 30000; // 30 seconds max
+        long startTime = System.currentTimeMillis();
+        int expectedResults = Math.min(successfulTasks, taskMap.size());
+
+        while (taskResults.size() < expectedResults && System.currentTimeMillis() - startTime < maxWaitTime) {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
 
-        // For demonstration, perform local parallel computation
-        // In a real scenario, you would aggregate results from workers
-        System.out.println("[Master] Computing result matrix in parallel locally...");
-        return multiplier.multiplyRowParallel(matrixA, matrixB);
+        System.out.println("[Master] Received " + taskResults.size() + " results from workers");
+
+        // Aggregate results into final matrix
+        for (Map.Entry<Integer, byte[]> entry : taskResults.entrySet()) {
+            try {
+                byte[] resultData = entry.getValue();
+                ByteArrayInputStream bais = new ByteArrayInputStream(resultData);
+                DataInputStream dis = new DataInputStream(bais);
+
+                int startRow = dis.readInt();
+                int endRow = dis.readInt();
+                int resultRows = dis.readInt();
+                int resultCols = dis.readInt();
+
+                // Read result rows and place in final matrix
+                for (int i = 0; i < resultRows; i++) {
+                    for (int j = 0; j < resultCols; j++) {
+                        result[startRow + i][j] = dis.readInt();
+                    }
+                }
+
+                System.out.println("[Master] Aggregated result rows " + startRow + " to " + endRow);
+            } catch (Exception e) {
+                System.err.println("[Master] Error aggregating result: " + e.getMessage());
+            }
+        }
+
+        // If no worker results, compute locally as fallback
+        if (taskResults.isEmpty()) {
+            System.out.println("[Master] No worker results, computing locally...");
+            return multiplier.multiplyRowParallel(matrixA, matrixB);
+        }
+
+        return result;
     }
 
     /**
