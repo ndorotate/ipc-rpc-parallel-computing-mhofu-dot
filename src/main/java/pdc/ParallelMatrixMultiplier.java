@@ -7,17 +7,17 @@ import java.util.concurrent.*;
  * using thread-based parallelization strategies.
  */
 public class ParallelMatrixMultiplier {
-    private final ExecutorService executor;
+    private final ExecutorService computeService;
     private final int numThreads;
 
     public ParallelMatrixMultiplier() {
         this.numThreads = Runtime.getRuntime().availableProcessors();
-        this.executor = Executors.newFixedThreadPool(numThreads);
+        this.computeService = Executors.newFixedThreadPool(numThreads);
     }
 
     public ParallelMatrixMultiplier(int numThreads) {
         this.numThreads = numThreads;
-        this.executor = Executors.newFixedThreadPool(numThreads);
+        this.computeService = Executors.newFixedThreadPool(numThreads);
     }
 
     /**
@@ -37,7 +37,7 @@ public class ParallelMatrixMultiplier {
 
         int rowsPerThread = Math.max(1, (m + numThreads - 1) / numThreads);
 
-        CompletionService<Void> completionService = new ExecutorCompletionService<>(executor);
+        CompletionService<Void> completionService = new ExecutorCompletionService<>(computeService);
         int taskCount = 0;
 
         // Submit row computation tasks
@@ -88,7 +88,7 @@ public class ParallelMatrixMultiplier {
 
         int colsPerThread = Math.max(1, (p + numThreads - 1) / numThreads);
 
-        CompletionService<Void> completionService = new ExecutorCompletionService<>(executor);
+        CompletionService<Void> completionService = new ExecutorCompletionService<>(computeService);
         int taskCount = 0;
 
         // Submit column computation tasks
@@ -139,7 +139,7 @@ public class ParallelMatrixMultiplier {
 
         int blockSize = Math.max(64, (int) Math.sqrt(m * p / numThreads));
 
-        CompletionService<Void> completionService = new ExecutorCompletionService<>(executor);
+        CompletionService<Void> completionService = new ExecutorCompletionService<>(computeService);
         int taskCount = 0;
 
         // Submit block computation tasks
@@ -183,14 +183,13 @@ public class ParallelMatrixMultiplier {
      * Shutdown the executor.
      */
     public void shutdown() {
-        executor.shutdown();
+        computeService.shutdown();
         try {
-            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
+            // Wait for graceful shutdown
+            Thread.sleep(10000);
         } catch (InterruptedException e) {
-            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
+        computeService.shutdownNow();
     }
 }

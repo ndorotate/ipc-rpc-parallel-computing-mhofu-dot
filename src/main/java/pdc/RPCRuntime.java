@@ -9,12 +9,12 @@ import java.util.concurrent.*;
  */
 public class RPCRuntime {
     private final ConcurrentHashMap<String, RPCMethod> registeredMethods = new ConcurrentHashMap<>();
-    private final ExecutorService rpcExecutor;
+    private final ExecutorService threadPool;
     private final String runtimeName;
 
     public RPCRuntime(String runtimeName, int threadPoolSize) {
         this.runtimeName = runtimeName;
-        this.rpcExecutor = Executors.newFixedThreadPool(threadPoolSize);
+        this.threadPool = Executors.newFixedThreadPool(threadPoolSize);
     }
 
     public RPCRuntime(String runtimeName) {
@@ -49,7 +49,7 @@ public class RPCRuntime {
             return failedFuture;
         }
 
-        return rpcExecutor.submit(() -> method.execute(requestPayload));
+        return threadPool.submit(() -> method.execute(requestPayload));
     }
 
     /**
@@ -77,15 +77,14 @@ public class RPCRuntime {
      * Shutdown the runtime.
      */
     public void shutdown() {
-        rpcExecutor.shutdown();
+        threadPool.shutdown();
         try {
-            if (!rpcExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
-                rpcExecutor.shutdownNow();
-            }
+            // Wait for graceful shutdown
+            Thread.sleep(5000);
         } catch (InterruptedException e) {
-            rpcExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
+        threadPool.shutdownNow();
     }
 
     /**
